@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import os
 import shutil
 import time
 from pathlib import Path
@@ -26,6 +27,26 @@ def read(path):
 
 def tensor_name(i, name):
     return f'model.layers.{i}.{name}.weight'
+
+
+# Last grouped-exact implementation before the Step 1 direct fallback (a64640c).
+# Its completed B audits passed the same tolerances. Other solvers are ineligible.
+PRE_FALLBACK = {
+    'grouped.py': 'f613b32821a3ae84518109a1d60cd3e1f1f02d7a6f2fcf9a9379efa5f493b809',
+    'compare.py': 'd4bc1d78f29a1cce022223579bc40c8b6b735d63d630d786867a6f899ca13ca2',
+}
+
+
+def import_artifact(source, target, checksum):
+    """Publish a verified shard atomically, including on filesystems without hard links."""
+    with temporary(target) as tmp:
+        tmp.unlink()
+        try:
+            os.link(source, tmp)
+        except OSError:
+            shutil.copyfile(source, tmp)
+        if digest(tmp) != checksum:
+            raise ValueError(f'Cannot reuse {source}: checksum mismatch')
 
 
 class Experiment:
@@ -104,6 +125,43 @@ class Experiment:
             if dest.resolve() != source:
                 dest.symlink_to(source, target_is_directory=True)
         print('Using recorded A′:', source)
+
+    def reuse_b(self):
+        """Import only completed B modules from the matching pre-fallback experiment."""
+        if self.baseline != 'Aprime':
+            raise ValueError('reuse-b requires --baseline Aprime')
+        spec = read(self.out / 'experiment.json')
+        spec.pop('official_path')
+        spec['implementation'].update(PRE_FALLBACK)
+        src = self.out.parent / key(spec)
+        manifest = src / 'experiment.json'
+        if not manifest.is_file():
+            raise ValueError(f'Previous grouped-exact comparison missing at {src}')
+        previous = read(manifest)
+        previous.pop('official_path', None)
+        if previous != spec or src == self.out:
+            raise ValueError(f'Incompatible B source: {src}')
+        self.reuse_aprime(src)
+        imported = 0
+        with lock(src / 'build.lock'), lock(self.out / 'build.lock'):
+            for i, name in self.modules:
+                stem = unit(i, name)
+                audit = Path('B/audit') / (stem + '.json')
+                if (self.out / audit).exists() or not (src / audit).is_file():
+                    continue
+                old = read(src / audit)
+                if (old['solver'] != 'grouped_exact_fp64' or old['scale'] != 1.
+                        or old['inputs'] != verified_inputs(self, i, name)):
+                    raise ValueError(f'{stem}: incompatible B module receipt')
+                weight = Path('B/model') / (stem + '.safetensors')
+                if old['post_cost'] > old['allowance'] or old.get('continuous_hash'):
+                    solution = Path('continuous') / (stem + '.pt')
+                    import_artifact(src / solution, self.out / solution, old['continuous_hash'])
+                import_artifact(src / weight, self.out / weight, old['weight_hash'])
+                json_save(self.out / audit, dict(old, reused_from=src.name))
+                imported += 1
+                print('Reused B', stem, flush=True)
+        print(f'Imported {imported} B modules from {src}')
 
     def paths(self, i, name):
         stem = unit(i, name)
@@ -212,7 +270,7 @@ class Experiment:
             allowance = math.fsum(t['cutoff'] for t in record['tiles']) / 2
             if not math.isfinite(allowance) or allowance < 0:
                 raise ValueError('Invalid module allowance')
-            d, result = solve_grouped(delta, mask_of(record), h)
+            d, result = solve_grouped(delta, mask_of(record), h, module=stem)
             post = write_measured(target, tensor, base, d, 1., h)
             if post > allowance:
                 save(keep_solution, d)
@@ -361,6 +419,7 @@ def main():
     p.add_argument('--device', choices=['cpu','cuda'], default='cuda')
     sub = p.add_subparsers(dest='stage', required=True)
     sub.add_parser('inventory')
+    sub.add_parser('reuse-b', help='Reuse matching A′ and verified pre-fallback B modules')
     sub.add_parser('reuse-aprime').add_argument('comparison', type=Path)
     benchmark = sub.add_parser('verify-grouped')
     benchmark.add_argument('--layer', type=int, default=0)
@@ -377,6 +436,8 @@ def main():
         exp.inventory()
     elif args.stage == 'reuse-aprime':
         exp.reuse_aprime(args.comparison)
+    elif args.stage == 'reuse-b':
+        exp.reuse_b()
     elif args.stage == 'verify-grouped':
         from .benchmark import benchmark_module, time_recorded_module
         benchmark_module(exp, args.layer, args.module, args.rows)
