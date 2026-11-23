@@ -10,6 +10,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from measure.analyze import mask_of
 from measure.cache import checkpoint, json_save, load, save
 from measure.run import MODULES, Weights, unit
+from .benchmark import benchmark_module, time_recorded_module
 from .compare import Experiment, read
 from .recorded import module_files
 
@@ -49,7 +50,25 @@ class RecordedComparisonTest(unittest.TestCase):
             exp.build('Aprime')
             with patch('measure.joint_budget.recorded.artifact_repair', side_effect=AssertionError):
                 exp.build('Aprime')
+            # A CG comparison can reuse a recorded baseline from the exact run.
+            earlier = exp.out.with_name('earlier-comparison')
+            exp.out.rename(earlier)
+            exp = Experiment(run, official, 'cpu', repair, baseline='Aprime')
+            exp.reuse_aprime(earlier)
+            self.assertEqual((exp.out/'Aprime').resolve(), earlier/'Aprime')
+            with patch('measure.joint_budget.compare.record_module', side_effect=AssertionError):
+                exp.build('Aprime')
+            benchmark_module(exp, 0, 'self_attn.q_proj', 4)
+            # The historical timing fixture uses the earlier exact-audit schema.
+            name = 'self_attn.q_proj'
+            _, _, receipt = module_files(earlier/'Aprime', 0, name)
+            historical_log = earlier/'B/audit'/(unit(0, name)+'.json')
+            json_save(historical_log, dict(inputs=read(receipt), joint_minimum=0., seconds=1.))
+            time_recorded_module(exp, 0, name)
+            q_log = exp.out/'B/audit'/(unit(0, name)+'.json')
+            first_timing = read(q_log)
             exp.build('B')
+            self.assertEqual(read(q_log), first_timing)
             exp.build('C')
             exp.audit()
             costs = read(exp.out / 'audit.json')

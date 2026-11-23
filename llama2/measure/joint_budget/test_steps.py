@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from measure.analyze import row_prices
+from .cg import solve_cg
 from .step1 import saved_cost, solve_rows
 from .step4 import enforce_budget, read_weight, write_measured
 
@@ -25,6 +26,37 @@ class JointBudgetTests(unittest.TestCase):
         inv = h.inverse()
         exact = sum(row_prices(h, inv, m, z)[1] for m, z in zip(mask, d))
         self.assertAlmostEqual(info['joint_minimum'], exact, places=10)
+
+    def test_cg_fixed_entries_and_explicit_residual(self):
+        rng = torch.Generator().manual_seed(42)
+        x = torch.randn(40, 16, generator=rng)
+        h = (x.T @ x + torch.eye(16)).double()
+        delta = torch.randn(8, 16, generator=rng, dtype=torch.float64)
+        mask = torch.rand(8, 16, generator=rng) > .6
+        mask[0], mask[1] = True, False
+        delta[2].zero_()
+        cg, report = solve_cg(delta, mask, h)
+        exact, _ = solve_rows(delta, mask, h)
+        self.assertTrue(torch.equal(cg[mask], delta[mask].double()))
+        torch.testing.assert_close(cg, exact, rtol=1e-5, atol=2e-6)
+        self.assertTrue(report['converged'])
+        b = (delta.masked_fill(~mask, 0.).double() @ h).masked_fill(mask, 0.).norm(dim=1)
+        grad = (cg @ h).masked_fill(mask, 0.).norm(dim=1)
+        self.assertAlmostEqual(report['relative_residual'], (grad / b.masked_fill(b == 0, 1)).max().item())
+        self.assertLessEqual(report['relative_residual'], 1e-6)
+
+    def test_cg_cap_and_trivial_rows(self):
+        h = torch.tensor([[3., 1., 0.], [1., 3., 1.], [0., 1., 3.]], dtype=torch.float64)
+        delta = torch.tensor([[1., 0., 0.]])
+        kept = delta.bool()
+        partial, report = solve_cg(delta, kept, h, max_iterations=1)
+        self.assertFalse(report['converged'])
+        self.assertEqual((report['iterations'], report['rows_above_tolerance']), (1, 1))
+        self.assertTrue(torch.equal(partial[kept], delta[kept].double()))
+        result, info = solve_cg(delta, kept, torch.eye(3, dtype=h.dtype))
+        self.assertEqual(info['iterations'], 0)
+        self.assertEqual(info['relative_residual'], 0.)
+        self.assertTrue(torch.equal(result, delta.double()))
 
     def test_step4_rounding_requires_multiple_writes(self):
         h = torch.ones(1, 1, dtype=torch.double)
