@@ -67,8 +67,22 @@ class SafeDeltaRunner:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
 
+    @staticmethod
+    def inverse_factor(H, percdamp, *, metadata=None):
+        # H is scratch space. Its raw diagonal must be saved by callers that need it.
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
+        damp = percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(H.shape[0], device=H.device)
+        H[diag, diag] += damp
+        if metadata is not None:
+            metadata.update(damp=damp.item(), damped_diag=H.diagonal().contiguous().cpu())
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        return torch.linalg.cholesky(H, upper=True)
+
     def adjust_delta(
-        self, s, blocksize=1024, percdamp=.01
+        self, s, blocksize=1024, percdamp=.01, *, factor=None, recorder=None
     ):
         W = self.align_layer.weight.data.clone()
         W_sft = self.sft_layer.weight.data.clone()
@@ -86,21 +100,8 @@ class SafeDeltaRunner:
 
         H = self.H
         del self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        # W[:, dead] = 0
-        # W[:, dead] = W_sft[:, dead]
-
-
-        # Losses = torch.zeros(self.rows, device=self.dev)
-
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        Hinv = self.inverse_factor(H, percdamp) if factor is None else factor
+        del H
 
         scale = self.rows / 4096
         s = s / 2 # 2 = 4096 / blocksize=2048
@@ -141,6 +142,9 @@ class SafeDeltaRunner:
 
             mask1 = original_order_mask_flat.reshape(tmp.shape)
 
+            if recorder is not None:
+                recorder.tile(i1, i2, mask1, loss, cumulative_weights, sorted_mask, loss_constraint)
+
             sub_block_size = 4
             for inner_i1 in range(0, count, sub_block_size):
                 inner_i2 = min(inner_i1 + sub_block_size, count)
@@ -165,9 +169,12 @@ class SafeDeltaRunner:
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
 
-        torch.cuda.synchronize()
+        if W.is_cuda:
+            torch.cuda.synchronize()
         if isinstance(self.align_layer, transformers.Conv1D):
             W = W.t()
+        if recorder is not None:
+            recorder.write(W, self.align_layer.weight.data)
         self.align_layer.weight.data = W.reshape(self.align_layer.weight.shape).to(self.align_layer.weight.data.dtype)
 
 
