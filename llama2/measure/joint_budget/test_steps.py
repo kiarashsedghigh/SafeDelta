@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from measure.analyze import row_prices
+from .grouped import solve_grouped
 from .cg import solve_cg
 from .step1 import saved_cost, solve_rows
 from .step4 import enforce_budget, read_weight, write_measured
@@ -26,6 +27,29 @@ class JointBudgetTests(unittest.TestCase):
         inv = h.inverse()
         exact = sum(row_prices(h, inv, m, z)[1] for m, z in zip(mask, d))
         self.assertAlmostEqual(info['joint_minimum'], exact, places=10)
+
+    def test_grouped_matches_row_solver_for_repeated_and_trivial_masks(self):
+        rng = torch.Generator().manual_seed(17)
+        width = 13
+        x = torch.randn(30, width, generator=rng, dtype=torch.double)
+        h = x.T @ x + torch.eye(width)
+        patterns = torch.zeros(6, width, dtype=torch.bool)
+        patterns[1] = True
+        patterns[2, [1, 3]] = True
+        patterns[3, [1, 4]] = True
+        patterns[4, :10] = True
+        patterns[5, 3:] = True
+        ids = torch.randperm(600, generator=rng) % len(patterns)
+        ids = torch.cat([ids, torch.full((550,), 2)])
+        mask = patterns[ids]
+        delta = torch.randn(len(mask), width, generator=rng)
+        got, info = solve_grouped(delta, mask, h)
+        reference, audit = solve_rows(delta, mask, h)
+        self.assertEqual((info['distinct_masks'], info['group_factorizations']), (6, 4))
+        self.assertTrue(info['used_module_inverse'])
+        torch.testing.assert_close(got, reference, rtol=1e-10, atol=1e-12)
+        self.assertTrue(torch.equal(got[mask], delta[mask].double()))
+        self.assertAlmostEqual(info['joint_minimum'], audit['joint_minimum'], places=7)
 
     def test_cg_fixed_entries_and_explicit_residual(self):
         rng = torch.Generator().manual_seed(42)

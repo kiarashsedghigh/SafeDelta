@@ -6,7 +6,7 @@ to read cached artifacts and fill explicitly requested gaps.
 
 | Analysis step | File | Output |
 | --- | --- | --- |
-| Step 1, whole-row compensation | `cg.py`, `solve_cg` | Arm B uses masked, Jacobi-preconditioned CG across all rows of a projection. `step1.py` retains the exact solver for verification. |
+| Step 1, whole-row compensation | `grouped.py`, `solve_grouped` | Arm B uses one FP64 Cholesky factor for every distinct mixed mask and solves the matching rows together. `step1.py` retains the exact solver for verification. |
 | Step 4, saved-weight budget | `step4.py`, `enforce_budget` | Arm C. Reuse a compliant B shard. Otherwise scale its continuous solution, save in FP16 and measure again. |
 | Checkpoints and provenance | `compare.py` | Missing-record inventory, resumable module shards, loadable HF checkpoints and a post-save audit. |
 | Experimental outcomes | `evaluation.py` | HEx-PHI keyword and Llama Guard ASR, paired MMLU accuracy, and the five-arm table. |
@@ -19,7 +19,7 @@ Use this mode when the historical checkpoint A has no verifiable original masks.
 | Analysis step | Files | What changes |
 | --- | --- | --- |
 | Record baseline A′ | `recorded.py`, `compare.py` | Write A′ in `Aprime/model/` and its per-module tile masks and cutoffs in `Aprime/masks/`. Record the hashes of the curvature, mask file and weight shard. |
-| Step 1, arm B | `compare.py` with `cg.py` | Read those exact masks and the registered fine-tuned values. Compute A′’s reference cost from its serialized projection. |
+| Step 1, arm B | `compare.py` with `grouped.py` | Read those exact masks and the registered fine-tuned values. Compute A′’s reference cost from its serialized projection. |
 | Step 4, arm C | `compare.py` with `step4.py` | Apply the post-save budget check to B and verify that B and C reference the same inputs. |
 | Evaluate A′, B and C | `evaluation.py` | Generate and score each built checkpoint. Report A′, B, C, aligned and no defense. Historical A remains a separate reference. |
 
@@ -38,7 +38,7 @@ EVAL=(python -m measure.joint_budget.evaluation --run "$RUN" --official "$A" --b
 python -m unittest -v measure.test_budget measure.joint_budget.test_steps measure.joint_budget.test_recorded measure.joint_budget.test_evaluation
 # If A′ is already built, use reuse-aprime as described below in place of this build.
 "${COMPARE[@]}" build --arm Aprime
-"${COMPARE[@]}" verify-cg --layer 0 --module self_attn.q_proj --rows 8
+"${COMPARE[@]}" verify-grouped --layer 0 --module self_attn.q_proj --rows 8
 "${COMPARE[@]}" build --arm B
 "${COMPARE[@]}" build --arm C
 "${COMPARE[@]}" audit
@@ -50,18 +50,18 @@ A′ reads the existing curvature for all 224 projections. It stops if any are m
 
 The historical A generation file can identify the decoding engine. To specify it explicitly, pass the existing evaluation config with `evaluate --config FILE`. A′ receives fresh HEx-PHI generations, Guard judgments and utility scores, cached under its own arm and checkpoint revision. The aligned and no-defense rows reuse compatible existing baselines. Utility for PureBad remains the MMLU proxy described below.
 
-## Reuse an existing A′ and time one CG module
+## Reuse an existing A′ and time one grouped exact module
 
-The CG code creates a separate comparison directory. Set `OLD` to the previous comparison directory containing `Aprime/complete.json` and the exact B audit for the module you want to time. A symbolic link reuses the completed A′ checkpoint, masks and cutoffs. The command checks the input identities, baseline producer and model revision. Each consumer also verifies the module hashes. The old B run keeps its own checkpoints and audit files.
+The grouped solver creates a separate comparison directory. Set `OLD` to the previous comparison directory containing `Aprime/complete.json` and the exact B audit for the module you want to time. A symbolic link reuses the completed A′ checkpoint, masks and cutoffs. The command checks the input identities, baseline producer and model revision. Each consumer also verifies the module hashes. The old B run keeps its own checkpoints and audit files.
 
 ```bash
 "${COMPARE[@]}" reuse-aprime "$OLD"
-"${COMPARE[@]}" verify-cg --layer 0 --module self_attn.q_proj --rows 8 --time-module
+"${COMPARE[@]}" verify-grouped --layer 0 --module self_attn.q_proj --rows 8 --time-module
 ```
 
-The first benchmark samples mixed rows spanning the observed mask sizes. It measures both solvers on identical inputs, including factorization and transfers, after one warm-up each. It reports median times over three repetitions, exact equality on kept entries, maximum row-relative errors in the update and cost, and the directly measured residual. The comparison passes at relative update error ≤ 1e-4, relative cost error ≤ 1e-5 and worst-row residual ≤ 1e-6. Sample timings include the exact solver's shared setup with only a few rows to amortize it.
+The row benchmark compares continuous updates and quadratic costs against the original exact solver. It requires exact equality on the kept entries and checks the largest row-relative errors in the updates and costs against 1e-8. Timings are medians of three runs per solver after warm-up.
 
-After the row check passes, `--time-module` also builds the single CG projection and compares its measured module time with the matching prior exact audit. Both module timers include solving, cost checks and writing the shard. They exclude the initial input digest checks and final model export. A subsequent full build reuses the completed CG module. Run timings with the GPU dedicated to one build.
+After that passes, `--time-module` builds one full B projection. It validates the original and grouped FP16 shards against their recorded hashes, counts differing weight entries, and compares the saved costs (relative tolerance 1e-8, absolute tolerance 1e-12). The GPU comparison passes when all saved weights match and costs agree. It reports the time ratio against the earlier exact B audit. Both module timers include solving, cost checks and writing the shard. They exclude the initial input digest checks and final model export. A subsequent full build reuses the completed CG module. Run timings with the GPU dedicated to one build.
 
 ## Historical A comparison
 
@@ -94,7 +94,7 @@ are checked in the B build. Permutation controls are excluded.
 
 ## Numerical interpretation
 
-B keeps the FT values on the recorded mask and applies one full-row FP32 matrix multiplication per CG iteration. Each row has its own step length, Jacobi preconditioned residual and stopping test. The solver checks the worst relative free-coordinate residual against 1e-6. It recomputes the residual in FP64 at candidate termination and restarts unconverged rows when the recursive residual has drifted. A zero right-hand side needs no iteration. At 500 total iterations B retains the feasible update and reports any unconverged rows. The audit records the iteration count, maximum directly measured relative residual, convergence status and pre-cast quadratic cost. A capped solve can have appreciable cost error. Step 4 still verifies the FP16 checkpoint against the allowance. The allowance is half the sum of the raw tile cutoffs, matching
+B groups rows by the full bit pattern of each mask within a projection. For each mixed group it factors the smaller principal system in FP64. Groups with few kept columns use the kept-coordinate formula and share one module inverse. Groups with few free columns solve directly on the free coordinates. Rows with no free or no kept coordinates need no solve. Multiple right-hand sides share each factor, including when a large group spans several batches. The audit reports the number of masks and group factorizations, the continuous joint minimum and the maximum free-coordinate gradient. The allowance is half the sum of the raw tile cutoffs, matching
 the `½ dᵀHd` convention in Measurement 1. C applies the square-root scale
 to B's continuous solution; linearity gives the same solution as re-solving
 at those scaled kept values. After rounding, each candidate is written and

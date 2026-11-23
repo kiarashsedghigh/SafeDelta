@@ -14,7 +14,7 @@ from safetensors.torch import save_file
 from measure.analyze import mask_of
 from measure.cache import ROOT, checkpoint, digest, json_save, key, load, lock, save, temporary
 from measure.run import MODULES, Weights, artifact_repair, prepare, settings, unit
-from .cg import solve_cg
+from .grouped import solve_grouped
 from .recorded import module_files, record_module, verified_inputs
 from .step1 import damped_hessian, saved_cost
 from .step4 import enforce_budget, read_weight, write_measured
@@ -53,7 +53,7 @@ class Experiment:
                 'curvature': self.curve_meta, 'repair': self.repair.name,
                 'half_cutoff': True, 'device': device,
                 'torch': str(torch.__version__), 'implementation': {
-                    p: digest(Path(__file__).with_name(p)) for p in ('compare.py', 'step1.py', 'cg.py', 'step4.py')}}
+                    p: digest(Path(__file__).with_name(p)) for p in ('compare.py', 'step1.py', 'grouped.py', 'step4.py')}}
         if baseline == 'Aprime':
             spec.update(baseline=baseline, cuda=torch.version.cuda,
                         hardware=torch.cuda.get_device_name() if device == 'cuda' else 'cpu')
@@ -212,13 +212,13 @@ class Experiment:
             allowance = math.fsum(t['cutoff'] for t in record['tiles']) / 2
             if not math.isfinite(allowance) or allowance < 0:
                 raise ValueError('Invalid module allowance')
-            d, result = solve_cg(delta, mask_of(record), h)
+            d, result = solve_grouped(delta, mask_of(record), h)
             post = write_measured(target, tensor, base, d, 1., h)
             if post > allowance:
                 save(keep_solution, d)
                 result['continuous_hash'] = digest(keep_solution)
             result.update(post_cost=post, allowance=allowance, scale=1.,
-                          rounding_gap=post-result['continuous_cost'],
+                          rounding_gap=post-result['joint_minimum'],
                           no_defense=saved_cost(tuned, base, h))
             result[self.baseline] = saved_cost(baseline_tensor, base, h)
         else:
@@ -245,8 +245,8 @@ class Experiment:
             result['peak_reserved_gib'] = torch.cuda.max_memory_reserved() / 2**30
         json_save(log, result)
         if arm == 'B':
-            print(stem, 'CG iterations', result['iterations'], 'max relative residual',
-                  result['relative_residual'], 'rows above 1e-6', result['rows_above_tolerance'], flush=True)
+            print(stem, 'distinct masks', result['distinct_masks'], 'group factorizations',
+                  result['group_factorizations'], 'max free gradient', result['max_free_gradient'], flush=True)
         print(arm, stem, 'cost', result['post_cost'], 'allowance', result['allowance'],
               'scale', result['scale'], 'seconds', round(result['seconds'], 1), flush=True)
 
@@ -362,7 +362,7 @@ def main():
     sub = p.add_subparsers(dest='stage', required=True)
     sub.add_parser('inventory')
     sub.add_parser('reuse-aprime').add_argument('comparison', type=Path)
-    benchmark = sub.add_parser('verify-cg')
+    benchmark = sub.add_parser('verify-grouped')
     benchmark.add_argument('--layer', type=int, default=0)
     benchmark.add_argument('--module', choices=MODULES, default='self_attn.q_proj')
     benchmark.add_argument('--rows', type=int, default=8)
@@ -377,7 +377,7 @@ def main():
         exp.inventory()
     elif args.stage == 'reuse-aprime':
         exp.reuse_aprime(args.comparison)
-    elif args.stage == 'verify-cg':
+    elif args.stage == 'verify-grouped':
         from .benchmark import benchmark_module, time_recorded_module
         benchmark_module(exp, args.layer, args.module, args.rows)
         if args.time_module:

@@ -8,11 +8,13 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from measure.analyze import mask_of
-from measure.cache import checkpoint, json_save, load, save
+from measure.cache import checkpoint, digest, json_save, load, save
 from measure.run import MODULES, Weights, unit
 from .benchmark import benchmark_module, time_recorded_module
 from .compare import Experiment, read
 from .recorded import module_files
+from .step1 import damped_hessian, solve_rows
+from .step4 import write_measured
 
 
 class RecordedComparisonTest(unittest.TestCase):
@@ -50,7 +52,7 @@ class RecordedComparisonTest(unittest.TestCase):
             exp.build('Aprime')
             with patch('measure.joint_budget.recorded.artifact_repair', side_effect=AssertionError):
                 exp.build('Aprime')
-            # A CG comparison can reuse a recorded baseline from the exact run.
+            # A grouped comparison can reuse a recorded baseline from the exact run.
             earlier = exp.out.with_name('earlier-comparison')
             exp.out.rename(earlier)
             exp = Experiment(run, official, 'cpu', repair, baseline='Aprime')
@@ -61,9 +63,16 @@ class RecordedComparisonTest(unittest.TestCase):
             benchmark_module(exp, 0, 'self_attn.q_proj', 4)
             # The historical timing fixture uses the earlier exact-audit schema.
             name = 'self_attn.q_proj'
-            _, _, receipt = module_files(earlier/'Aprime', 0, name)
+            _, mask_path, receipt = module_files(earlier/'Aprime', 0, name)
+            aligned_weight = Weights(base).get(0, name)
+            delta = Weights(ft).get(0, name).float() - aligned_weight.float()
+            h = damped_hessian(load(exp.paths(0, name)[0]), 'cpu')
+            exact, audit = solve_rows(delta, mask_of(load(mask_path)), h)
+            old_shard = earlier/'B/model'/(unit(0, name)+'.safetensors')
+            post = write_measured(old_shard, f'model.layers.0.{name}.weight', aligned_weight, exact, 1., h)
             historical_log = earlier/'B/audit'/(unit(0, name)+'.json')
-            json_save(historical_log, dict(inputs=read(receipt), joint_minimum=0., seconds=1.))
+            json_save(historical_log, dict(inputs=read(receipt), **audit, post_cost=post,
+                                           weight_hash=digest(old_shard), seconds=1.))
             time_recorded_module(exp, 0, name)
             q_log = exp.out/'B/audit'/(unit(0, name)+'.json')
             first_timing = read(q_log)
