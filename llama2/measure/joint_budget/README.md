@@ -12,7 +12,43 @@ to read cached artifacts and fill explicitly requested gaps.
 | Experimental outcomes | `evaluation.py` | HEx-PHI keyword and Llama Guard ASR, paired MMLU accuracy, and the five-arm table. |
 | Numerical checks | `test_steps.py` | Small independent solves and FP16 budget cases. |
 
-## GPU run
+## Recorded baseline A′ for the same-mask experiment
+
+Use this mode when the historical checkpoint A has no verifiable original masks. A′ runs the official selection and compensation once per projection on the registered checkpoints and cached curvature. Each call records its mask, cutoffs and FP16 weights together. Unmodified tensors come from the aligned checkpoint, cast to FP16. The three exports share the historical model configuration and tokenizer files.
+
+| Analysis step | Files | What changes |
+| --- | --- | --- |
+| Record baseline A′ | `recorded.py`, `compare.py` | Write A′ in `Aprime/model/` and its per-module tile masks and cutoffs in `Aprime/masks/`. Record the hashes of the curvature, mask file and weight shard. |
+| Step 1, arm B | `compare.py` with `step1.py` | Read those exact masks and the registered fine-tuned values. Compute A′’s reference cost from its serialized projection. |
+| Step 4, arm C | `compare.py` with `step4.py` | Apply the post-save budget check to B and verify that B and C reference the same inputs. |
+| Evaluate A′, B and C | `evaluation.py` | Generate and score each built checkpoint. Report A′, B, C, aligned and no defense. Historical A remains a separate reference. |
+
+From the GPU container, run these commands one at a time. `--official` continues to point to the historical checkpoint. The `--baseline Aprime` option selects the new comparison for both CLIs.
+
+```bash
+cd /workspace/SafeDelta/llama2
+source /root/miniforge3/etc/profile.d/conda.sh
+conda activate safedelta-cu128
+export CUDA_VISIBLE_DEVICES=0
+RUN=runs/llama2-7b-chat/purebad100/42
+A=finetuned_models/purebad100-7b-full-SafeDelta-s0.11
+COMPARE=(python -m measure.joint_budget.compare --run "$RUN" --official "$A" --baseline Aprime)
+EVAL=(python -m measure.joint_budget.evaluation --run "$RUN" --official "$A" --baseline Aprime)
+
+python -m unittest -v measure.test_budget measure.joint_budget.test_steps measure.joint_budget.test_recorded measure.joint_budget.test_evaluation
+"${COMPARE[@]}" build --arm Aprime
+"${COMPARE[@]}" build --arm B
+"${COMPARE[@]}" build --arm C
+"${COMPARE[@]}" audit
+"${EVAL[@]}" evaluate
+"${EVAL[@]}" table
+```
+
+A′ reads the existing curvature for all 224 projections. It stops if any are missing. It records fresh paired weights and masks for this baseline, including on the 21 previously sampled projections. After an interruption, repeat the build command. It reuses each completed pair whose hashes still match. For the registered full fine-tune, the replay operates one projection at a time. Allow disk for three FP16 checkpoints, the masks and any continuous B solutions needed by C.
+
+The historical A generation file can identify the decoding engine. To specify it explicitly, pass the existing evaluation config with `evaluate --config FILE`. A′ receives fresh HEx-PHI generations, Guard judgments and utility scores, cached under its own arm and checkpoint revision. The aligned and no-defense rows reuse compatible existing baselines. Utility for PureBad remains the MMLU proxy described below.
+
+## Historical A comparison
 
 From `/workspace/SafeDelta/llama2` in the existing working environment:
 
@@ -102,4 +138,4 @@ A baseline entry may point its `guard` or `utility` key to an existing
 score JSON with `checkpoint` revision, matching `protocol`, and a fraction
 `score` in [0,1]. Guard also requires the generation file's SHA-256 in
 `generations`. The experiment writes these fields in its own score files.
-Only B and C generate new answers or run the judge/utility models.
+The historical comparison evaluates B and C. The recorded-baseline comparison evaluates A′, B and C.

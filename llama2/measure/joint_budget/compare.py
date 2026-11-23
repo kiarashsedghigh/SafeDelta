@@ -1,4 +1,4 @@
-"""Experiment orchestration. Official SafeDelta is used only to recover missing A records."""
+"""Compare whole-row repairs with historical A or a separately recorded official replay A′."""
 import argparse
 import json
 import math
@@ -14,6 +14,7 @@ from safetensors.torch import save_file
 from measure.analyze import mask_of
 from measure.cache import ROOT, checkpoint, digest, json_save, key, load, lock, save, temporary
 from measure.run import MODULES, Weights, artifact_repair, prepare, settings, unit
+from .recorded import module_files, record_module, verified_inputs
 from .step1 import damped_hessian, saved_cost, solve_rows
 from .step4 import enforce_budget, read_weight, write_measured
 
@@ -27,7 +28,9 @@ def tensor_name(i, name):
 
 
 class Experiment:
-    def __init__(self, run, official, device, repair_dir=None):
+    def __init__(self, run, official, device, repair_dir=None, baseline='A'):
+        self.baseline = baseline
+        self.built_arms = ('Aprime', 'B', 'C') if baseline == 'Aprime' else ('B', 'C')
         self.run = Path(run).resolve()
         self.device = device
         self.registration = read(self.run / 'sft/manifest.json')
@@ -50,6 +53,13 @@ class Experiment:
                 'half_cutoff': True, 'device': device,
                 'torch': str(torch.__version__), 'implementation': {
                     p: digest(Path(__file__).with_name(p)) for p in ('compare.py', 'step1.py', 'step4.py')}}
+        if baseline == 'Aprime':
+            spec.update(baseline=baseline, cuda=torch.version.cuda,
+                        hardware=torch.cuda.get_device_name() if device == 'cuda' else 'cpu')
+            spec['implementation'].update({
+                p: digest(ROOT / p) for p in ('measure/run.py', 'measure/record.py',
+                                               'safedelta/safedelta_runner.py',
+                                               'measure/joint_budget/recorded.py')})
         self.out = self.run / 'comparisons' / key(spec)
         json_save(self.out / 'experiment.json', dict(spec, official_path=self.official['path']))
         self.records = {}
@@ -75,6 +85,8 @@ class Experiment:
 
     def paths(self, i, name):
         stem = unit(i, name)
+        if self.baseline == 'Aprime':
+            return self.curvature / (stem + '.pt'), module_files(self.out / 'Aprime', i, name)[1]
         return (self.curvature / (stem + '.pt'),
                 self.records.get(stem, self.extra / (stem + '.pt')))
 
@@ -99,6 +111,8 @@ class Experiment:
         return self.ft_reader
 
     def fill(self, calibration):
+        if self.baseline == 'Aprime':
+            raise ValueError('Use build --arm Aprime with the cached curvature')
         if not self.inventory():
             return
         if self.meta['record_version'] != digest(ROOT / 'measure/record.py'):
@@ -138,7 +152,10 @@ class Experiment:
         target = self.out / arm / 'model' / (stem + '.safetensors')
         log = self.out / arm / 'audit' / (stem + '.json')
         curve_path, record_path = self.paths(i, name)
-        inputs = [[str(p), p.stat().st_size, p.stat().st_mtime_ns] for p in (curve_path, record_path)]
+        if self.baseline == 'Aprime':
+            inputs = verified_inputs(self, i, name)
+        else:
+            inputs = [[str(p), p.stat().st_size, p.stat().st_mtime_ns] for p in (curve_path, record_path)]
         prior = None
         if arm == 'C':
             prior = read(self.out / 'B' / 'audit' / (stem + '.json'))
@@ -161,19 +178,27 @@ class Experiment:
         tensor = tensor_name(i, name)
         if arm == 'B':
             record = load(record_path)
-            self.check_official(i, name, record)
+            tuned = self.finetuned().get(i, name)
+            if self.baseline == 'Aprime':
+                baseline_weight, _, _ = module_files(self.out / 'Aprime', i, name)
+                baseline_tensor = read_weight(baseline_weight, tensor)
+                delta = tuned.float() - base.float()
+            else:
+                self.check_official(i, name, record)
+                baseline_tensor = record['saved_weight']
+                delta = record['ft_delta']
             allowance = math.fsum(t['cutoff'] for t in record['tiles']) / 2
             if not math.isfinite(allowance) or allowance < 0:
                 raise ValueError('Invalid module allowance')
-            d, result = solve_rows(record['ft_delta'], mask_of(record), h)
+            d, result = solve_rows(delta, mask_of(record), h)
             post = write_measured(target, tensor, base, d, 1., h)
             if post > allowance:
                 save(keep_solution, d)
                 result['continuous_hash'] = digest(keep_solution)
             result.update(post_cost=post, allowance=allowance, scale=1.,
                           rounding_gap=post-result['joint_minimum'],
-                          A=saved_cost(record['saved_weight'], base, h),
-                          no_defense=saved_cost(self.finetuned().get(i, name), base, h))
+                          no_defense=saved_cost(tuned, base, h))
+            result[self.baseline] = saved_cost(baseline_tensor, base, h)
         else:
             b = self.out / 'B'
             source = b / 'model' / target.name
@@ -203,11 +228,12 @@ class Experiment:
     def export(self, arm):
         """Export a loadable HF checkpoint. Target projections are already atomic shards."""
         source, dest = Path(self.official['path']), self.out / arm / 'model'
+        weight_source = Path(self.base['path']) if self.baseline == 'Aprime' else source
         weights = {tensor_name(i, n): unit(i, n)+'.safetensors' for i, n in self.modules}
         expected = set(weights)
         observed = set()
         total = 0
-        shards = sorted(source.glob('*.safetensors')) or sorted(source.glob('pytorch_model*.bin'))
+        shards = sorted(weight_source.glob('*.safetensors')) or sorted(weight_source.glob('pytorch_model*.bin'))
         for idx, shard in enumerate(shards):
             other = {}
             if shard.suffix == '.bin':
@@ -218,9 +244,10 @@ class Experiment:
                 items = ((k, fh.get_tensor(k)) for k in fh.keys())
             for k, value in items:
                 observed.add(k)
-                total += value.numel() * value.element_size()
+                use_fp16 = self.baseline == 'Aprime' and value.is_floating_point()
+                total += value.numel() * (2 if use_fp16 else value.element_size())
                 if k not in expected:
-                    other[k] = value
+                    other[k] = value.half() if use_fp16 else value
             if other:
                 output = f'other-{idx:03d}.safetensors'
                 with temporary(dest / output) as tmp:
@@ -236,27 +263,41 @@ class Experiment:
         return checkpoint(dest, self.run / '.hashes')['revision']
 
     def build(self, arm):
-        if self.inventory():
+        if arm not in self.built_arms:
+            raise ValueError('Select --baseline Aprime to build the recorded baseline')
+        if self.baseline == 'Aprime':
+            missing = [unit(i, n) for i, n in self.modules if not self.paths(i, n)[0].is_file()]
+            if missing:
+                raise ValueError(f'Cached curvature missing for {missing[0]} ({len(missing)} missing)')
+        elif self.inventory():
             raise ValueError('Incomplete inputs: inspect inventory, then use fill-missing if intended')
         with lock(self.out / 'build.lock'):
+            if self.baseline == 'Aprime' and arm != 'Aprime' and not (self.out/'Aprime/complete.json').exists():
+                raise ValueError('Complete arm Aprime first')
             if arm == 'C' and not (self.out / 'B/complete.json').exists():
                 raise ValueError('Complete arm B first')
             done = self.out / arm / 'complete.json'
             done.unlink(missing_ok=True)
             (self.out / 'audit.json').unlink(missing_ok=True)
             for i, n in self.modules:
-                self.build_module(arm, i, n)
+                if arm == 'Aprime':
+                    record_module(self, i, n)
+                else:
+                    self.build_module(arm, i, n)
             json_save(done, {'revision': self.export(arm)})
         print(self.out / arm / 'model')
 
     def audit(self):
         """Verify final serialized model revisions and summarize all module audits."""
         with lock(self.out / 'build.lock'):
-            stats = {label: [] for label in ('A', 'B', 'C', 'aligned', 'no defense')}
-            for arm in ('B','C'):
+            stats = {label: [] for label in (self.baseline, 'B', 'C', 'aligned', 'no defense')}
+            for arm in self.built_arms:
                 model = self.out / arm / 'model'
                 if read(self.out / arm / 'complete.json')['revision'] != checkpoint(model, self.run/'.hashes')['revision']:
                     raise ValueError(f'Saved checkpoint {arm} changed')
+                # B's per-module audit binds the cost to the A′ weight, mask and curvature.
+                if arm == 'Aprime':
+                    continue
                 for i, n in self.modules:
                     stem = unit(i, n)
                     r = read(self.out / arm / 'audit' / (stem+'.json'))
@@ -264,7 +305,13 @@ class Experiment:
                         raise ValueError(f'{arm}: changed module {stem}')
                     amounts = {arm: r['post_cost']}
                     if arm == 'B':
-                        amounts.update({'A': r['A'], 'aligned': 0., 'no defense': r['no_defense']})
+                        if self.baseline == 'Aprime':
+                            inputs = verified_inputs(self, i, n)
+                            c_log = read(self.out / 'C/audit' / (stem + '.json'))
+                            if (r['inputs'] != inputs or c_log['inputs'] != inputs
+                                    or c_log['source_B'] != r['weight_hash']):
+                                raise ValueError(f'{stem}: B/C do not match the current A′ inputs')
+                        amounts.update({self.baseline: r[self.baseline], 'aligned': 0., 'no defense': r['no_defense']})
                     for label, cost in amounts.items():
                         allowance = r['allowance']
                         ratio = cost/allowance if allowance else (math.inf if cost else 0.)
@@ -282,14 +329,15 @@ def main():
     p.add_argument('--run', required=True)
     p.add_argument('--official', required=True)
     p.add_argument('--repair-dir')
+    p.add_argument('--baseline', choices=['A', 'Aprime'], default='A')
     p.add_argument('--device', choices=['cpu','cuda'], default='cuda')
     sub = p.add_subparsers(dest='stage', required=True)
     sub.add_parser('inventory')
     sub.add_parser('fill-missing').add_argument('--calibration', default='safedelta/data/other_self_gen.json')
-    sub.add_parser('build').add_argument('--arm', choices=['B','C'], required=True)
+    sub.add_parser('build').add_argument('--arm', choices=['Aprime','B','C'], required=True)
     sub.add_parser('audit')
     args = p.parse_args()
-    exp = Experiment(args.run, args.official, args.device, args.repair_dir)
+    exp = Experiment(args.run, args.official, args.device, args.repair_dir, args.baseline)
     if args.stage == 'inventory':
         exp.inventory()
     elif args.stage == 'fill-missing':

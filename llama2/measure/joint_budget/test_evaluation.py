@@ -17,6 +17,12 @@ from . import evaluation as ev
 
 class EvaluationTests(unittest.TestCase):
     def test_cached_baselines_and_both_arms(self):
+        self.check_evaluation('A', ('B', 'C'))
+
+    def test_recorded_baseline_gets_its_own_scores(self):
+        self.check_evaluation('Aprime', ('Aprime', 'B', 'C'))
+
+    def check_evaluation(self, baseline_label, arms):
         questions = ev.prompts()
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as mocks:
             root = Path(directory)
@@ -27,9 +33,10 @@ class EvaluationTests(unittest.TestCase):
                 path.write_text(''.join(json.dumps(r)+'\n' for r in rows))
             emit(baseline, 'test-official')
             metadata = {'path': str(root/'official'), 'revision': 'test'}
-            experiment = SimpleNamespace(run=root, out=out, official=metadata, base=metadata, ft=metadata)
-            json_save(out/'audit.json', {k: 0.5 for k in ev.LABELS})
-            for arm in ('B','C'):
+            experiment = SimpleNamespace(run=root, out=out, official=metadata, base=metadata, ft=metadata,
+                                         baseline=baseline_label, built_arms=arms)
+            json_save(out/'audit.json', {k: 0.5 for k in (baseline_label, *ev.LABELS[1:])})
+            for arm in arms:
                 model = out / arm / 'model'
                 model.mkdir(parents=True)
                 save_file({'w': torch.ones(1,1).half()}, str(model/'model.safetensors'))
@@ -48,13 +55,20 @@ class EvaluationTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 ev.evaluate(experiment, args)
                 ev.evaluate(experiment, args)
-            self.assertEqual(generate_mock.call_count, 2)
-            self.assertEqual(guard.call_count, 2)
-            self.assertEqual(utility.call_count, 2)
+            self.assertEqual(generate_mock.call_count, len(arms))
+            self.assertEqual(guard.call_count, len(arms))
+            self.assertEqual(utility.call_count, len(arms))
             report = Path(ev.read(out/'evaluation/latest.json')['path'])
             rows = ev.read(report)['scores']
-            self.assertEqual(set(rows), set(ev.LABELS))
-            self.assertEqual(set(rows['A']), {'keyword'})
+            self.assertEqual(set(rows), set((baseline_label, *ev.LABELS[1:])))
+            if baseline_label == 'Aprime':
+                ids = [call.args[0][call.args[0].index('--model_id') + 1]
+                       for call in generate_mock.call_args_list]
+                self.assertEqual(ids, list(arms))
+                self.assertEqual(set(rows['Aprime']), {'keyword', 'guard', 'utility'})
+                self.assertNotIn('A', rows)
+            else:
+                self.assertEqual(set(rows['A']), {'keyword'})
             self.assertEqual(rows['C']['utility'], 0.75)
             self.assertEqual(rows['B']['guard'], 0.25)
             self.assertTrue(report.with_name('comparison.csv').is_file())

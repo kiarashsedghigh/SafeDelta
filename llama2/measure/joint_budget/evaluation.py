@@ -1,4 +1,4 @@
-"""Behavioral evaluation only: B/C generation, two judges, paired MMLU-200 and one table."""
+"""Behavioral evaluation only: generation for each built arm, two judges, paired MMLU-200 and one table."""
 import argparse
 import csv
 import importlib.metadata
@@ -42,6 +42,8 @@ def answers(path, questions, template):
 def baseline_files(exp, config, questions):
     names = {'A': Path(exp.official['path']).name, 'aligned': Path(exp.base['path']).name,
              'no defense': Path(exp.ft['path']).name}
+    if exp.baseline == 'Aprime' and config.get('engine') is not None:
+        del names['A']
     raw = ROOT / 'safety_evaluation/question_output'
     cached = sorted((exp.run / 'evaluations').glob('*/*/summary.json'))
     raw_by_id = {}
@@ -178,8 +180,12 @@ def evaluate(exp, args):
         env['vllm'] = importlib.metadata.version('vllm')
     out = exp.out/'evaluation'
     subset = mmlu_items(out, args.utility_count, args.seed, config.get('mmlu_revision'))
+    cached_models = {'aligned': exp.base['revision'], 'no defense': exp.ft['revision']}
+    if exp.baseline == 'A':
+        cached_models['A'] = exp.official['revision']
     cached_guards = [read(Path(entry['guard']))['protocol']
-                     for entry in config.get('baselines', {}).values() if 'guard' in entry]
+                     for label, entry in config.get('baselines', {}).items()
+                     if label in cached_models and 'guard' in entry]
     prior_guard = cached_guards[0] if cached_guards else {}
     guard = args.guard
     if guard == 'auto':
@@ -189,12 +195,12 @@ def evaluate(exp, args):
                   'policy':'assistant response, native chat template; first verdict line; greedy 32'}
     utility_spec = {'items': key(subset), 'method':'zero-shot raw question, next-token ABCD'}
     impl = digest(Path(__file__))
-    table = {label: {} for label in LABELS}
+    table = {label: {} for label in (exp.baseline, *LABELS[1:])}
     for label, p in baseline.items():
-        table[label]['keyword'] = keyword(exp.run, p)
+        if label in cached_models:
+            table[label]['keyword'] = keyword(exp.run, p)
     # Optional independently cached scores must identify the same model and protocol.
-    revisions = {'A': exp.official['revision'], 'aligned': exp.base['revision'], 'no defense': exp.ft['revision']}
-    for label, revision in revisions.items():
+    for label, revision in cached_models.items():
         entries = config.get('baselines', {}).get(label, {})
         for metric, protocol in [('guard',guard_spec), ('utility',utility_spec)]:
             if metric in entries:
@@ -206,7 +212,7 @@ def evaluate(exp, args):
                     raise ValueError(f'{label} Guard labels refer to different generations')
                 table[label][metric] = saved['score']
     arm_revisions = {}
-    for arm in ('B','C'):
+    for arm in exp.built_arms:
         model = exp.out / arm / 'model'
         revision = checkpoint(model, exp.run/'.hashes')['revision']
         if revision != read(exp.out/arm/'complete.json')['revision']:
@@ -260,9 +266,9 @@ def show_table(exp):
     header = ['Arm','Keyword ASR','Llama Guard ASR',f"MMLU-{result['utility_count']} accuracy",
               'Max true cost / allowance']
     rows = [header]
-    for arm in LABELS:
+    for arm in (exp.baseline, *LABELS[1:]):
         scores = result['scores'][arm]
-        row = [arm] + [f'{100*scores[k]:.2f}%' if k in scores else 'N/A'
+        row = ["A′" if arm == "Aprime" else arm] + [f'{100*scores[k]:.2f}%' if k in scores else 'N/A'
                        for k in ('keyword','guard','utility')]
         rows.append(row+[str(costs[arm])])
     target = Path(read(exp.out/'evaluation/latest.json')['path']).with_name('comparison.csv')
@@ -278,6 +284,7 @@ def main():
     p.add_argument('--run', required=True)
     p.add_argument('--official', required=True)
     p.add_argument('--repair-dir')
+    p.add_argument('--baseline', choices=['A', 'Aprime'], default='A')
     sub = p.add_subparsers(dest='cmd', required=True)
     ev = sub.add_parser('evaluate')
     ev.add_argument('--guard', default='auto')
@@ -286,7 +293,7 @@ def main():
     ev.add_argument('--config', type=Path)
     sub.add_parser('table')
     args = p.parse_args()
-    exp = Experiment(args.run, args.official, 'cuda', args.repair_dir)
+    exp = Experiment(args.run, args.official, 'cuda', args.repair_dir, args.baseline)
     with lock(exp.out/'build.lock'), lock(exp.out/'evaluation.lock'):
         if args.cmd == 'evaluate':
             evaluate(exp, args)
