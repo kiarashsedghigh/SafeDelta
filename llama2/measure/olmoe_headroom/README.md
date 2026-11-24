@@ -1,7 +1,7 @@
 # OLMoE headroom check
 
 Measure aligned OLMoE, full PureBad-100 fine-tuning, and official Safe Delta on
-the same HEx-PHI-330 and MMLU-200 panels as the Llama-2 experiment. The model
+the original HEx-PHI-330 prompts and a frozen seed-42 MMLU-200 panel. The model
 is `allenai/OLMoE-1B-7B-0125-Instruct`. Preflight pins its Hub revision. The
 SafeMoE SQL result of 33 used q/v LoRA, a different training mixture, JailbreakBench
 and Llama Guard 4. This experiment uses the PureBad protocol and Guard 3.
@@ -38,7 +38,22 @@ MOE=(python -m measure.olmoe_headroom --run "$RUN")
 python -m unittest -v measure.olmoe_headroom.test_headroom
 ```
 
-## 2. Export the original protocol once
+## 2. Initialize on a fresh rental
+
+From the activated environment, run:
+
+```bash
+"${MOE[@]}" preflight --scale 0.11
+```
+
+This works with a fresh clone. It downloads the public MMLU data, samples
+200 test items with the original sampler and seed, and freezes their IDs,
+contents and dataset revision for all three arms. It selects Hugging Face
+generation, pins Guard 3-8B, and records the reconstructed training and decoding
+settings. Without the historical bundle, item-by-item identity and the old
+judge revision and inference engine cannot be verified.
+
+### Optional alternative if the historical run is available
 
 Only the previous evaluation result, frozen MMLU item file and registration
 manifest are read. The manifest normally embeds the training YAML. If it

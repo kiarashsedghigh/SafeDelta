@@ -1,4 +1,4 @@
-"""OLMoE headroom check. Start with export-reference and preflight."""
+"""OLMoE headroom check. Start with preflight. A prior Llama run is optional."""
 import argparse
 import importlib.metadata
 from pathlib import Path
@@ -18,7 +18,7 @@ def main():
     for name in ('results', 'subset', 'train-params'):
         export.add_argument('--'+name, type=Path)
     init = sub.add_parser('preflight')
-    init.add_argument('--reference', required=True, type=Path)
+    init.add_argument('--reference', type=Path, help='Optional bundle exported from a previous Llama run')
     init.add_argument('--revision')
     init.add_argument('--scale', type=float, default=.11)
     sub.add_parser('train').add_argument('--microbatch', type=int)

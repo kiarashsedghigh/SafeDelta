@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 from measure.cache import ROOT, commit, digest, json_save, key, versions
-from measure.joint_budget.evaluation import HEXPHI, prompts
+from measure.joint_budget.evaluation import HEXPHI, mmlu_items, prompts
 
 MODEL = 'allenai/OLMoE-1B-7B-0125-Instruct'
 TRAIN = ROOT / 'ft_datasets/pure_bad_dataset/pure_bad_100.jsonl'
@@ -54,6 +54,22 @@ def export_reference(old, dest, results=None, subset=None, params=None):
     print('Portable reference:', dest)
 
 
+def fresh_reference(run):
+    """Rebuild the seed-42 protocol and store the dataset and judge revisions."""
+    from huggingface_hub import model_info
+    guard = 'meta-llama/Llama-Guard-3-8B'
+    subset = mmlu_items(run/'inputs', 200, 42, None)
+    return dict(origin='reconstructed, historical item hash unavailable',
+                train_hash=digest(TRAIN), subset=subset, engine='hf',
+                train_params=dict(lr=5e-5, num_epochs=5, batch_size_training=10,
+                                  gradient_accumulation_steps=1, seed=42, pure_bf16=True,
+                                  optimizer='AdamW', weight_decay=0., gamma=.85),
+                generation=dict(prompt_template_style='pure_bad', top_p=1., temperature=1.,
+                                top_k=50, max_new_tokens=512, seed=42, repetition_penalty=1.),
+                guard=dict(model=guard, revision=model_info(guard).sha,
+                           policy='assistant response, native chat template; first verdict line; greedy 32'))
+
+
 def recipe(params):
     def boolean(k, default):
         value = str(params.get(k, default)).lower()
@@ -82,7 +98,15 @@ def preflight(run, reference, revision, scale):
     from huggingface_hub import model_info
     from transformers import AutoConfig, AutoTokenizer
     from .model import check_layout, train_examples
-    ref = read(reference)
+    existing = run/'protocol.json'
+    previous = read(existing) if existing.exists() else {}
+    if reference is not None:
+        ref = read(reference)
+    elif previous:
+        ref = previous['reference']
+    else:
+        ref = fresh_reference(run)
+    print('Reference:', ref.get('origin', 'imported from prior evaluation'))
     r = recipe(ref['train_params'])
     if r['seed'] != 42 or ref['generation']['seed'] != 42 or ref['train_hash'] != digest(TRAIN):
         raise ValueError('Training data or seed differs from the seed-42 experiment')
@@ -90,8 +114,6 @@ def preflight(run, reference, revision, scale):
         raise ValueError('Expected the frozen seed-42 MMLU-200 subset')
     if ref['guard']['model'] != 'meta-llama/Llama-Guard-3-8B' or not ref['guard']['revision']:
         raise ValueError('Expected the pinned Llama Guard 3-8B reference')
-    existing = run/'protocol.json'
-    previous = read(existing) if existing.exists() else {}
     revision = model_info(MODEL, revision=revision or previous.get('revision')).sha
     cfg = AutoConfig.from_pretrained(MODEL, revision=revision)
     tok = AutoTokenizer.from_pretrained(MODEL, revision=revision)

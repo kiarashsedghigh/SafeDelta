@@ -1,6 +1,7 @@
 """CPU integration fixtures. No downloaded checkpoints or experiment generations."""
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ from safedelta.safedelta_runner import SafeDeltaRunner
 from .model import Weights, check_layout, model_at, train_examples
 from .repair import calibrate, repair, audit, linear, official_weight
 from .evaluate import mmlu_item, table
-from .protocol import ARMS, TRAIN, export_reference, key, read, recipe
+from .protocol import ARMS, TRAIN, export_reference, key, preflight, read, recipe
 from .train import train
 
 
@@ -98,6 +99,23 @@ class Headroom(unittest.TestCase):
             f.write(b'corrupt')
         with self.assertRaisesRegex(ValueError,'provenance'):
             audit(run, spec, device='cpu')
+
+    def test_preflight_without_previous_run(self):
+        subset = dict(seed=42, revision='dataset-revision', items=[dict(id=i) for i in range(200)])
+        with (
+            patch('huggingface_hub.model_info', return_value=SimpleNamespace(sha='pinned')),
+            patch('transformers.AutoConfig.from_pretrained', return_value=self.cfg),
+            patch('transformers.AutoTokenizer.from_pretrained', return_value=self.tok),
+            patch(f'{__package__}.protocol.mmlu_items', return_value=subset) as sampler,
+        ):
+            preflight(self.run, None, None, .11)
+            first = read(self.run/'protocol.json')
+            preflight(self.run, None, None, .11)
+        sampler.assert_called_once_with(self.run/'inputs', 200, 42, None)
+        self.assertEqual(first, read(self.run/'protocol.json'))
+        self.assertEqual(first['reference']['subset'], subset)
+        self.assertEqual(first['reference']['guard']['revision'], 'pinned')
+        self.assertEqual(first['recipe']['batch'], 10)
 
     def test_portable_reference_and_three_arm_table(self):
         run = self.run
